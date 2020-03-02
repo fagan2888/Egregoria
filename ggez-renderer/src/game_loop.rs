@@ -4,13 +4,14 @@ use crate::rendering::render_context::RenderContext;
 use crate::rendering::road_rendering::RoadRenderer;
 use crate::rendering::sorted_mesh_renderer::SortedMeshRenderer;
 use cgmath::Vector2;
+use cgmath::{vec2, InnerSpace};
 use ggez::graphics::{Color, DrawMode, Font};
 use ggez::input::keyboard::{KeyCode, KeyMods};
 use ggez::input::mouse::MouseButton;
 use ggez::{filesystem, graphics, timer, Context, GameResult};
 use scale::engine_interaction;
 use scale::engine_interaction::{KeyboardInfo, MouseInfo, RenderStats, TimeInfo};
-use scale::geometry::intersections::intersection_point;
+use scale::geometry::intersections::{intersection_point, Ray};
 use scale::gui::Gui;
 use scale::interaction::FollowEntity;
 use scale::map_model::Map;
@@ -18,6 +19,7 @@ use scale::physics::{PhysicsWorld, Transform};
 use scale::specs::{Dispatcher, RunNow, World, WorldExt};
 use std::collections::HashSet;
 use std::iter::FromIterator;
+use std::rc::Rc;
 
 pub struct EngineState<'a> {
     pub world: World,
@@ -25,10 +27,12 @@ pub struct EngineState<'a> {
     pub cam: CameraHandler,
     pub render_enabled: bool,
     pub grid: bool,
-    pub font: Font,
+    pub font: Option<Font>,
     pub imgui_wrapper: ImGuiWrapper,
     pub smr: SortedMeshRenderer,
     pub road_render: RoadRenderer,
+    lignes: Vec<Ligne>,
+    gen_lignes: Vec<Rc<GeneratedLigne>>,
 }
 
 impl<'a> EngineState<'a> {
@@ -39,15 +43,62 @@ impl<'a> EngineState<'a> {
     ) -> GameResult<EngineState<'a>> {
         println!("{}", filesystem::resources_dir(ctx).display());
 
-        let font = graphics::Font::new(ctx, "/bmonofont-i18n.ttf")?;
+        // let font = graphics::Font::new(ctx, "/bmonofont-i18n.ttf")?;
         //        let text = graphics::Text::new(("Hello world!", font, 48.0));
         //       let test: Image = graphics::Image::new(ctx, "/test.png")?;
 
         graphics::set_resizable(ctx, true)?;
         let (width, height) = graphics::drawable_size(ctx);
         let imgui_wrapper = ImGuiWrapper::new(&mut ctx);
+
+        const PI: f32 = std::f32::consts::PI;
+
+        const SCALE: f32 = 100.0;
+
+        let gen_1 = Rc::new(GeneratedLigne {
+            ray: Ray {
+                from: vec2(0.0, -0.1),
+                dir: vec2(0.0, 1.0),
+            },
+            length: SCALE,
+        });
+
+        let gen_2 = Rc::new(GeneratedLigne {
+            ray: Ray {
+                from: vec2(-0.01, 0.01),
+                dir: vec2((-PI / 6.0).cos(), (-PI / 6.0).sin()),
+            },
+            length: SCALE,
+        });
+
+        let gen_3 = Rc::new(GeneratedLigne {
+            ray: Ray {
+                from: vec2(0.01, 0.01),
+                dir: vec2((PI + PI / 6.0).cos(), (PI + PI / 6.0).sin()),
+            },
+            length: SCALE,
+        });
+
+        let init_lignes = vec![
+            Ligne {
+                koch_segment: (SCALE * gen_1.ray.dir, SCALE * gen_2.ray.dir),
+                left_parent: gen_1.clone(),
+                right_parent: gen_2.clone(),
+            },
+            Ligne {
+                koch_segment: (SCALE * gen_2.ray.dir, SCALE * gen_3.ray.dir),
+                left_parent: gen_2.clone(),
+                right_parent: gen_3.clone(),
+            },
+            Ligne {
+                koch_segment: (SCALE * gen_3.ray.dir, SCALE * gen_1.ray.dir),
+                left_parent: gen_3.clone(),
+                right_parent: gen_1.clone(),
+            },
+        ];
+
         Ok(EngineState {
-            font,
+            font: None,
             world,
             dispatch,
             cam: CameraHandler::new(width, height),
@@ -56,7 +107,93 @@ impl<'a> EngineState<'a> {
             imgui_wrapper,
             smr: SortedMeshRenderer::new(),
             road_render: RoadRenderer::new(),
+            lignes: init_lignes,
+            gen_lignes: vec![gen_1, gen_2, gen_3],
         })
+    }
+}
+
+#[derive(Clone)]
+struct Ligne {
+    koch_segment: (Vector2<f32>, Vector2<f32>),
+    left_parent: Rc<GeneratedLigne>,
+    right_parent: Rc<GeneratedLigne>,
+}
+
+struct GeneratedLigne {
+    ray: Ray,
+    length: f32,
+}
+
+impl Ligne {
+    fn generate(self) -> Option<(Rc<GeneratedLigne>, [Ligne; 4])> {
+        let tip = self.get_tip();
+        let mid = self.get_middle();
+
+        let tip_towards_center = Ray {
+            from: tip,
+            dir: (mid - tip).normalize(),
+        };
+
+        let inter = intersection_point(tip_towards_center, self.left_parent.ray)?;
+
+        let generated = Rc::new(GeneratedLigne {
+            ray: Ray {
+                from: inter,
+                dir: (tip - mid).normalize(),
+            },
+            length: (tip - inter).magnitude(),
+        });
+
+        let left = Ligne {
+            koch_segment: (self.koch_segment.0, self.get_first_third()),
+            left_parent: self.left_parent.clone(),
+            right_parent: self.left_parent.clone(),
+        };
+
+        let first1 = Ligne {
+            koch_segment: (self.get_first_third(), tip),
+            left_parent: generated.clone(),
+            right_parent: generated.clone(),
+        };
+
+        let first2 = Ligne {
+            koch_segment: (tip, self.get_second_third()),
+            left_parent: generated.clone(),
+            right_parent: generated.clone(),
+        };
+
+        let right = Ligne {
+            koch_segment: (self.get_second_third(), self.koch_segment.1),
+            left_parent: self.right_parent.clone(),
+            right_parent: self.right_parent,
+        };
+
+        Some((generated, [left, first1, first2, right]))
+    }
+
+    fn get_first_third(&self) -> Vector2<f32> {
+        2.0 * self.koch_segment.0 / 3.0 + self.koch_segment.1 / 3.0
+    }
+
+    fn get_second_third(&self) -> Vector2<f32> {
+        self.koch_segment.0 / 3.0 + 2.0 * self.koch_segment.1 / 3.0
+    }
+
+    fn get_middle(&self) -> Vector2<f32> {
+        (self.koch_segment.0 + self.koch_segment.1) / 2.0
+    }
+
+    fn get_koch_len(&self) -> f32 {
+        (self.koch_segment.0 - self.koch_segment.1).magnitude()
+    }
+
+    fn get_tip(&self) -> Vector2<f32> {
+        let middle = self.get_middle();
+        let l = self.get_koch_len() / 3.0;
+        let norm = (self.koch_segment.1 - self.koch_segment.0).normalize();
+        let norm = vec2(-norm.y, norm.x);
+        middle + norm * l * 3.0_f32.sqrt() / 2.0
     }
 }
 
@@ -179,6 +316,25 @@ impl<'a> ggez::event::EventHandler for EngineState<'a> {
             }
         }
 
+        rc.sr.color.r = 1.0;
+        rc.sr.color.g = 0.0;
+        rc.sr.color.b = 0.0;
+        rc.sr.color.a = 1.0;
+
+        for lol in &self.gen_lignes {
+            rc.sr
+                .draw_line(lol.ray.from, lol.ray.from + lol.ray.dir * lol.length);
+        }
+
+        rc.sr.color.r = 1.0;
+        rc.sr.color.g = 1.0;
+        rc.sr.color.b = 1.0;
+        rc.sr.color.a = 1.0;
+
+        for lol in &self.lignes {
+            rc.sr.draw_line(lol.koch_segment.0, lol.koch_segment.1);
+        }
+
         rc.finish()?;
 
         let mut gui: Gui = (*self.world.read_resource::<Gui>()).clone();
@@ -218,6 +374,16 @@ impl<'a> ggez::event::EventHandler for EngineState<'a> {
         }
         if keycode == KeyCode::G {
             self.grid = !self.grid;
+        }
+        if keycode == KeyCode::K {
+            let mut to_add = vec![];
+            for ligne in self.lignes.drain(..) {
+                if let Some((a, b)) = ligne.generate() {
+                    to_add.extend_from_slice(&b);
+                    self.gen_lignes.push(a);
+                }
+            }
+            self.lignes = to_add;
         }
         //println!("Key pressed {:?}", keycode);
 

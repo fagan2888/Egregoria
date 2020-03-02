@@ -24,8 +24,8 @@ pub struct Gui {
 impl Default for Gui {
     fn default() -> Self {
         Self {
-            show_car_ui: true,
-            show_stats: true,
+            show_car_ui: false,
+            show_stats: false,
             show_tips: false,
             n_cars: 1,
         }
